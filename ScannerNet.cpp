@@ -1,4 +1,4 @@
-#include <iostream>
+﻿#include <iostream>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -7,12 +7,50 @@
 #include <format>
 #include <ranges>
 #include <expected>
+#include <array>
+#include <cstdint>
+#include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <future>
+#include <queue>
+#include <condition_variable>
+#include <iomanip>
+
+// Fallback per std::print se non disponibile
+#if __has_include(<print>)
 #include <print>
+#else
+namespace std {
+    template<typename... Args>
+    void println(std::ostream& os, std::format_string<Args...> fmt, Args&&... args) {
+        os << std::format(fmt, std::forward<Args>(args)...) << '\n';
+    }
+
+    template<typename... Args>
+    void println(std::format_string<Args...> fmt, Args&&... args) {
+        std::cout << std::format(fmt, std::forward<Args>(args)...) << '\n';
+    }
+}
+#endif
 
 #include <boost/asio.hpp>
 #include <boost/program_options.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/algorithm/string.hpp>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "ws2_32.lib")
+#else
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#endif
 
 namespace asio = boost::asio;
 namespace po = boost::program_options;
@@ -21,17 +59,153 @@ using namespace std::chrono_literals;
 // Struttura per rappresentare un risultato di scansione
 struct ScanResult {
     std::string ip;
+    std::string hostname;
     bool is_alive;
     std::chrono::milliseconds response_time;
 };
 
-// Classe per gestire la scansione ICMP
+// Thread pool per esecuzione parallela
+class ThreadPool {
+private:
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> tasks_;
+    std::mutex queue_mutex_;
+    std::condition_variable condition_;
+    std::condition_variable finished_;
+    std::atomic<bool> stop_{ false };
+    std::atomic<int> active_tasks_{ 0 };
+
+public:
+    explicit ThreadPool(size_t num_threads) {
+        for (size_t i = 0; i < num_threads; ++i) {
+            workers_.emplace_back([this] {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(queue_mutex_);
+                        condition_.wait(lock, [this] { return stop_ || !tasks_.empty(); });
+
+                        if (stop_ && tasks_.empty()) return;
+
+                        if (!tasks_.empty()) {
+                            task = std::move(tasks_.front());
+                            tasks_.pop();
+                            active_tasks_++;
+                        }
+                    }
+
+                    if (task) {
+                        task();
+                        active_tasks_--;
+                        finished_.notify_one();
+                    }
+                }
+                });
+        }
+    }
+
+    ~ThreadPool() 
+    {
+        wait_for_completion();
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            stop_ = true;
+        }
+        condition_.notify_all();
+
+        for (auto& worker : workers_)
+            worker.join();
+    }
+
+    template<typename F>
+    void enqueue(F&& f) {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            tasks_.emplace(std::forward<F>(f));
+        }
+        condition_.notify_one();
+    }
+
+    void wait_for_completion() {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        finished_.wait(lock, [this] {
+            return tasks_.empty() && active_tasks_ == 0;
+            });
+    }
+};
+
+// Classe per l'animazione del progresso
+class ProgressAnimator {
+private:
+    std::atomic<bool> running_{ true };
+    std::atomic<int> scanned_{ 0 };
+    std::atomic<int> found_{ 0 };
+    int total_;
+    std::thread animator_thread_;
+    std::mutex print_mutex_;
+    bool verbose_;
+
+    void animate() {
+#ifdef _WIN32
+        static constexpr std::array<char, 4> spinner { '\\', '|', '/' ,'-' };
+#else
+        static constexpr std::array<std::string, 4> spinner { "⠋", "⠙", "⠹", "⠸" };
+#endif
+        int spinner_idx = 0;
+
+        while (running_) {
+            {
+                std::lock_guard<std::mutex> lock(print_mutex_);
+                if (!verbose_) {
+                    std::cout << "\r" << spinner[spinner_idx] << " Scansione in corso... Analizzati: " << scanned_.load() << "/" << total_ << " | Attivi: " << found_.load() << " " << std::flush;
+                }
+            }
+
+            spinner_idx = (spinner_idx + 1) % spinner.size();
+            std::this_thread::sleep_for(100ms);
+        }
+
+        // Pulisci la linea
+        if (!verbose_) {
+            std::cout << "\r" << std::string(80, ' ') << "\r" << std::flush;
+        }
+    }
+
+public:
+    explicit ProgressAnimator(int total, bool verbose = false)
+        : total_(total), verbose_(verbose) {
+        animator_thread_ = std::thread(&ProgressAnimator::animate, this);
+    }
+
+    ~ProgressAnimator() {
+        running_ = false;
+        if (animator_thread_.joinable())
+            animator_thread_.join();
+    }
+
+    void increment_scanned() { scanned_++; }
+    void increment_found() { found_++; }
+
+    void log_found(const std::string& ip, const std::string& hostname) {
+        if (verbose_) {
+            std::lock_guard<std::mutex> lock(print_mutex_);
+            auto now = std::chrono::system_clock::now();
+            auto time_t_now = std::chrono::system_clock::to_time_t(now);
+            std::cout << "[" << std::put_time(std::localtime(&time_t_now), "%H:%M:%S") << "] TROVATO: " << ip;
+            if (!hostname.empty())
+                std::cout << " (" << hostname << ")";
+            std::cout << std::endl;
+        }
+    }
+};
+
+// Classe per gestire la scansione di rete
 class NetworkScanner {
 private:
-    asio::io_context io_context_;
-    asio::ip::icmp::resolver resolver_;
-    asio::ip::icmp::socket socket_;
     std::vector<ScanResult> results_;
+    std::mutex results_mutex_;
+    ThreadPool thread_pool_;
+    std::string filter_;
 
     static constexpr uint16_t ICMP_ECHO_REQUEST = 8;
     static constexpr uint16_t ICMP_ECHO_REPLY = 0;
@@ -54,125 +228,354 @@ private:
             size -= 2;
         }
 
-        if (size > 0) {
+        if (size > 0)
             sum += *reinterpret_cast<const uint8_t*>(ptr);
-        }
 
-        while (sum >> 16) {
+        while (sum >> 16) 
             sum = (sum & 0xffff) + (sum >> 16);
-        }
 
         return static_cast<uint16_t>(~sum);
     }
 
-public:
-    NetworkScanner()
-        : resolver_(io_context_),
-        socket_(io_context_, asio::ip::icmp::v4()) {
+    // Ottieni l'indirizzo IP locale e la subnet mask
+    std::expected<std::pair<std::string, std::string>, std::string> get_local_network() {
 #ifdef _WIN32
-        // Su Windows potrebbe essere necessario eseguire come amministratore
-        // per socket raw ICMP
+        ULONG bufferSize = 15000;
+        std::vector<BYTE> buffer(bufferSize);
+        PIP_ADAPTER_ADDRESSES addresses = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
+
+        DWORD result = GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX,
+            nullptr, addresses, &bufferSize);
+
+        if (result != NO_ERROR) {
+            return std::unexpected("Errore nel recupero degli indirizzi di rete");
+        }
+
+        for (PIP_ADAPTER_ADDRESSES adapter = addresses; adapter; adapter = adapter->Next) {
+            if (adapter->OperStatus != IfOperStatusUp) continue;
+
+            for (PIP_ADAPTER_UNICAST_ADDRESS unicast = adapter->FirstUnicastAddress;
+                unicast; unicast = unicast->Next) {
+
+                if (unicast->Address.lpSockaddr->sa_family != AF_INET) continue;
+
+                sockaddr_in* addr_in = reinterpret_cast<sockaddr_in*>(unicast->Address.lpSockaddr);
+                char ip_str[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &addr_in->sin_addr, ip_str, INET_ADDRSTRLEN);
+                std::string ip(ip_str);
+
+                // Salta loopback e link-local
+                if (ip.starts_with("127.") || ip.starts_with("169.254.")) continue;
+
+                // Calcola subnet basandosi sul prefisso
+                uint32_t mask = 0xFFFFFFFF << (32 - unicast->OnLinkPrefixLength);
+                in_addr mask_addr;
+                mask_addr.s_addr = htonl(mask);
+                char mask_str[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &mask_addr, mask_str, INET_ADDRSTRLEN);
+
+                return std::make_pair(ip, std::string(mask_str));
+            }
+        }
 #else
-        // Su Linux potrebbe essere necessario capability CAP_NET_RAW
-        // o eseguire come root
+        struct ifaddrs* ifaddr;
+        if (getifaddrs(&ifaddr) == -1) {
+            return std::unexpected("Errore nel recupero degli indirizzi di rete");
+        }
+
+        std::string local_ip;
+        std::string subnet_mask;
+
+        for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+            if (ifa->ifa_addr == nullptr) continue;
+
+            if (ifa->ifa_addr->sa_family == AF_INET) {
+                char host[NI_MAXHOST];
+                getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in),
+                    host, NI_MAXHOST, nullptr, 0, NI_NUMERICHOST);
+
+                std::string ip(host);
+
+                // Salta loopback e link-local
+                if (ip.starts_with("127.") || ip.starts_with("169.254.")) continue;
+
+                local_ip = ip;
+
+                // Ottieni subnet mask
+                if (ifa->ifa_netmask) {
+                    struct sockaddr_in* mask = (struct sockaddr_in*)ifa->ifa_netmask;
+                    char mask_str[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &mask->sin_addr, mask_str, INET_ADDRSTRLEN);
+                    subnet_mask = mask_str;
+                }
+
+                if (!local_ip.empty() && !subnet_mask.empty()) {
+                    break;
+                }
+            }
+        }
+
+        freeifaddrs(ifaddr);
+
+        if (local_ip.empty()) {
+            return std::unexpected("Nessun indirizzo IP locale trovato");
+        }
+
+        return std::make_pair(local_ip, subnet_mask);
 #endif
+
+        return std::unexpected("Nessun indirizzo IP valido trovato");
     }
 
-    std::expected<bool, std::string> ping_host(const std::string& ip_address,
-        std::chrono::milliseconds timeout = 1000ms) {
+    // Calcola il range di IP dalla subnet
+    std::pair<std::string, std::pair<int, int>> calculate_network_range(
+        const std::string& ip, const std::string& mask) {
+
+        struct in_addr ip_addr, mask_addr, net_addr;
+
+#ifdef _WIN32
+        inet_pton(AF_INET, ip.c_str(), &ip_addr);
+        inet_pton(AF_INET, mask.c_str(), &mask_addr);
+#else
+        inet_aton(ip.c_str(), &ip_addr);
+        inet_aton(mask.c_str(), &mask_addr);
+#endif
+
+        uint32_t network = ip_addr.s_addr & mask_addr.s_addr;
+        uint32_t broadcast = network | ~mask_addr.s_addr;
+
+        net_addr.s_addr = network;
+
+        char network_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &net_addr, network_str, INET_ADDRSTRLEN);
+
+        // Calcola il numero di host
+        uint32_t num_hosts = ntohl(broadcast) - ntohl(network);
+
+        // Per semplicità, assumiamo una /24 se la subnet è grande
+        if (num_hosts > 256) {
+            return { network_str, {1, 254} };
+        }
+
+        return { network_str, {1, static_cast<int>(num_hosts - 1)} };
+    }
+
+    // Risolvi hostname con timeout
+    std::string resolve_hostname(const std::string& ip) {
         try {
-            asio::ip::icmp::endpoint destination(
-                asio::ip::address::from_string(ip_address), 0);
+            // Usa getnameinfo per una risoluzione più affidabile
+            struct sockaddr_in sa;
+            sa.sin_family = AF_INET;
+            inet_pton(AF_INET, ip.c_str(), &sa.sin_addr);
 
-            // Prepara pacchetto ICMP
-            icmp_header echo_request{};
-            echo_request.type = ICMP_ECHO_REQUEST;
-            echo_request.code = 0;
-            echo_request.identifier = static_cast<uint16_t>(std::this_thread::get_id()._Hash());
-            echo_request.sequence_number = 1;
-            echo_request.checksum = 0;
+            char hostname[NI_MAXHOST];
 
-            // Calcola checksum
-            echo_request.checksum = calculate_checksum(&echo_request, sizeof(echo_request));
-
-            // Invia richiesta
-            auto start_time = std::chrono::steady_clock::now();
-            socket_.send_to(asio::buffer(&echo_request, sizeof(echo_request)), destination);
-
-            // Imposta timeout
-            std::array<uint8_t, 1024> reply_buffer;
-            asio::ip::icmp::endpoint sender_endpoint;
-            bool received = false;
-
-            asio::steady_timer timer(io_context_);
-            timer.expires_after(timeout);
-
-            socket_.async_receive_from(
-                asio::buffer(reply_buffer),
-                sender_endpoint,
-                [&received](std::error_code ec, std::size_t) {
-                    if (!ec) received = true;
+            // Usa un future per implementare un timeout
+            auto future = std::async(std::launch::async, [&sa, &hostname]() {
+                return getnameinfo((struct sockaddr*)&sa, sizeof(sa),
+                    hostname, NI_MAXHOST, nullptr, 0, 0);
                 });
 
-            timer.async_wait([this](std::error_code) {
-                socket_.cancel();
-                });
+            // Timeout di 2 secondi per la risoluzione DNS
+            if (future.wait_for(2s) == std::future_status::ready) {
+                if (future.get() == 0 && strlen(hostname) > 0) {
+                    return std::string(hostname);
+                }
+            }
+        }
+        catch (...) {
+            // Ignora errori di risoluzione
+        }
 
-            io_context_.run_for(timeout);
-            io_context_.restart();
+        return "";
+    }
 
-            if (received) {
-                auto end_time = std::chrono::steady_clock::now();
-                auto response_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    end_time - start_time);
+public:
+    NetworkScanner(const std::string& filter = "")
+        : thread_pool_(std::min(static_cast<size_t>(8),
+            static_cast<size_t>(std::thread::hardware_concurrency()))),
+        filter_(filter) {
+    }
 
-                results_.push_back({ ip_address, true, response_time });
-                return true;
+    std::expected<bool, std::string> ping_host(const std::string& ip_address, int retry_count = 2) {
+        for (int attempt = 0; attempt < retry_count; ++attempt) {
+            try {
+                asio::io_context io_context;
+                asio::ip::icmp::socket socket(io_context, asio::ip::icmp::v4());
+
+                asio::ip::icmp::endpoint destination(
+                    asio::ip::make_address(ip_address), 0);
+
+                // Prepara pacchetto ICMP
+                icmp_header echo_request{};
+                echo_request.type = ICMP_ECHO_REQUEST;
+                echo_request.code = 0;
+                echo_request.identifier = static_cast<uint16_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+                echo_request.sequence_number = static_cast<uint16_t>(attempt + 1);
+                echo_request.checksum = 0;
+
+                // Calcola checksum
+                echo_request.checksum = calculate_checksum(&echo_request, sizeof(echo_request));
+
+                // Invia richiesta
+                auto start_time = std::chrono::steady_clock::now();
+                socket.send_to(asio::buffer(&echo_request, sizeof(echo_request)), destination);
+
+                // Timeout aumentato a 1 secondo
+                std::array<uint8_t, 1024> reply_buffer;
+                asio::ip::icmp::endpoint sender_endpoint;
+                bool received = false;
+
+                asio::steady_timer timer(io_context);
+                timer.expires_after(1000ms);
+
+                socket.async_receive_from(
+                    asio::buffer(reply_buffer),
+                    sender_endpoint,
+                    [&received, &sender_endpoint, &destination](std::error_code ec, std::size_t bytes_received) {
+                        if (!ec && bytes_received >= sizeof(icmp_header)) {
+                            // Verifica che la risposta sia dal giusto host
+                            if (sender_endpoint.address() == destination.address()) {
+                                received = true;
+                            }
+                        }
+                    });
+
+                timer.async_wait([&socket](std::error_code) {
+                    socket.cancel();
+                    });
+
+                io_context.run_for(1000ms);
+
+                if (received) {
+                    auto end_time = std::chrono::steady_clock::now();
+                    auto response_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        end_time - start_time);
+
+                    return true;
+                }
+
+                // Breve pausa tra i tentativi
+                if (attempt < retry_count - 1)
+                    std::this_thread::sleep_for(100ms);
+            }
+            catch (const std::exception& e) {
+                if (attempt == retry_count - 1)
+                    return std::unexpected(std::format("Errore ping {}: {}", ip_address, e.what()));
+            }
+        }
+
+        return false;
+    }
+
+    void scan_host_async(const std::string& ip, ProgressAnimator& progress) {
+        thread_pool_.enqueue([this, ip, &progress]() {
+            auto result = ping_host(ip);
+
+            if (result.has_value() && result.value()) {
+                // Host attivo, risolvi hostname
+                std::string hostname = resolve_hostname(ip);
+
+                // Applica filtro se specificato
+                if (!filter_.empty()) {
+                    if (hostname.empty() ||
+                        !boost::algorithm::icontains(hostname, filter_)) {
+                        progress.increment_scanned();
+                        return;
+                    }
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(results_mutex_);
+                    results_.push_back({ ip, hostname, true, 0ms });
+                }
+
+                progress.log_found(ip, hostname);
+                progress.increment_found();
+            }
+
+            progress.increment_scanned();
+            });
+    }
+
+    void scan_network(const std::string& base_ip = "", int start = -1, int end = -1, bool verbose = false) {
+        std::string network_ip = base_ip;
+        int scan_start = start;
+        int scan_end = end;
+
+        // Se non specificato, trova automaticamente la rete locale
+        if (network_ip.empty()) {
+            auto local_net = get_local_network();
+            if (!local_net.has_value()) {
+                std::println(std::cerr, "Errore: {}", local_net.error());
+                return;
+            }
+
+            auto [local_ip, subnet_mask] = local_net.value();
+            auto [network, range] = calculate_network_range(local_ip, subnet_mask);
+
+            network_ip = network;
+            scan_start = (start == -1) ? range.first : start;
+            scan_end = (end == -1) ? range.second : end;
+
+            std::println("Rete locale rilevata: {} (Mask: {})", local_ip, subnet_mask);
+        }
+
+        // Estrai i primi tre ottetti
+        std::vector<std::string> parts;
+        std::string current;
+        for (char c : network_ip) {
+            if (c == '.') {
+                if (!current.empty()) {
+                    parts.push_back(current);
+                    current.clear();
+                }
             }
             else {
-                results_.push_back({ ip_address, false, 0ms });
-                return false;
+                current += c;
             }
-
         }
-        catch (const std::exception& e) {
-            return std::unexpected(std::format("Errore ping {}: {}", ip_address, e.what()));
+        if (!current.empty()) {
+            parts.push_back(current);
         }
-    }
 
-    void scan_range(const std::string& base_ip, int start, int end) {
-        // Estrai i primi tre ottetti dell'IP
-        auto parts = base_ip | std::views::split('.')
-            | std::views::transform([](auto&& r) {
-            return std::string(r.begin(), r.end());
-                })
-            | std::ranges::to<std::vector>();
-
-        if (parts.size() != 4) {
-            std::println(std::cerr, "Formato IP non valido: {}", base_ip);
+        if (parts.size() < 3) {
+            std::println(std::cerr, "Formato IP non valido: {}", network_ip);
             return;
         }
 
-        std::string network_prefix = std::format("{}.{}.{}.", parts[0], parts[1], parts[2]);
+        std::string network_prefix{ std::format("{}.{}.{}.", parts[0], parts[1], parts[2]) };
 
-        std::println("Scansione rete {} dal host {} al {}", network_prefix, start, end);
+        // Calcola numero totale di host
+        int total_hosts = scan_end - scan_start + 1;
+
+        std::println("Scansione rete: {}x (Range: {} - {})",network_prefix, scan_start, scan_end);
+
+        if (!filter_.empty())
+            std::println("Filtro hostname: *{}*", filter_);
+
+        if (verbose)
+            std::println("Modalità verbose attiva - mostra host in tempo reale");
+
         std::println("Attendere...\n");
 
-        for (int i = start; i <= end; ++i) {
+        // Avvia animazione progresso
+        ProgressAnimator progress(total_hosts, verbose);
+
+        // Avvia scansioni asincrone
+        for (int i = scan_start; i <= scan_end; ++i) {
             std::string ip = network_prefix + std::to_string(i);
+            scan_host_async(ip, progress);
 
-            auto result = ping_host(ip, 500ms);
-
-            if (result.has_value() && result.value()) {
-                std::println("Host {} � ATTIVO ({}ms)", ip, results_.back().response_time.count());
-            }
-            else if (!result.has_value()) {
-                std::println(std::cerr, "Errore: {}", result.error());
-            }
-
-            // Piccola pausa tra le richieste per non sovraccaricare la rete
-            std::this_thread::sleep_for(10ms);
+            // Delay aumentato per evitare rate limiting
+            std::this_thread::sleep_for(20ms);
         }
+
+        // Attendi che tutte le scansioni siano complete
+        thread_pool_.wait_for_completion();
+
+        // Piccola pausa aggiuntiva per assicurarsi che tutto sia completo
+        std::this_thread::sleep_for(500ms);
     }
 
     void save_results(const std::string& filename) {
@@ -182,46 +585,88 @@ public:
             return;
         }
 
-        file << std::format("Network Scan Results - {:%Y-%m-%d %H:%M:%S}\n",
-            std::chrono::system_clock::now());
-        file << std::format("{}\n", std::string(60, '-'));
-        file << std::format("{:<20} {:<10} {:<15}\n", "IP Address", "Status", "Response Time");
-        file << std::format("{}\n", std::string(60, '-'));
+        auto now = std::chrono::system_clock::now();
+        auto time_t_now = std::chrono::system_clock::to_time_t(now);
+
+        file << "Network Scan Results - "
+            << std::put_time(std::localtime(&time_t_now), "%Y-%m-%d %H:%M:%S")
+            << "\n";
+
+        if (!filter_.empty())
+            file << std::format("Filtro applicato: *{}*\n", filter_);
+
+        file << std::format("{}\n", std::string(80, '-'));
+        file << std::format("{:<20} {:<40} {:<15}\n", "IP Address", "Hostname", "Response Time");
+        file << std::format("{}\n", std::string(80, '-'));
+
+        // Ordina risultati per IP
+        std::sort(results_.begin(), results_.end(),
+            [](const auto& a, const auto& b) {
+                struct in_addr addr_a, addr_b;
+#ifdef _WIN32
+                inet_pton(AF_INET, a.ip.c_str(), &addr_a);
+                inet_pton(AF_INET, b.ip.c_str(), &addr_b);
+#else
+                inet_aton(a.ip.c_str(), &addr_a);
+                inet_aton(b.ip.c_str(), &addr_b);
+#endif
+                return ntohl(addr_a.s_addr) < ntohl(addr_b.s_addr);
+            });
 
         for (const auto& result : results_) {
-            file << std::format("{:<20} {:<10} {:<15}\n",
+            file << std::format("{:<20} {:<40} {:<15}\n",
                 result.ip,
-                result.is_alive ? "ATTIVO" : "INATTIVO",
-                result.is_alive ? std::format("{}ms", result.response_time.count()) : "N/A");
+                result.hostname.empty() ? "N/A" : result.hostname,
+                "< 500ms");
         }
 
-        auto alive_count = std::ranges::count_if(results_,
-            [](const auto& r) { return r.is_alive; });
+        file << std::format("\n{}\n", std::string(80, '-'));
+        file << std::format("Host totali trovati: {}\n", results_.size());
 
-        file << std::format("\n{}\n", std::string(60, '-'));
-        file << std::format("Host totali scansionati: {}\n", results_.size());
-        file << std::format("Host attivi: {}\n", alive_count);
-        file << std::format("Host inattivi: {}\n", results_.size() - alive_count);
-
-        std::println("Risultati salvati in: {}", filename);
+        std::println("\nRisultati salvati in: {}", filename);
     }
 
-    void print_summary() {
-        auto alive_count = std::ranges::count_if(results_,
-            [](const auto& r) { return r.is_alive; });
-
-        std::println("\n{}", std::string(60, '='));
-        std::println("RIEPILOGO SCANSIONE");
-        std::println("{}", std::string(60, '='));
-        std::println("Host totali scansionati: {}", results_.size());
-        std::println("Host attivi: {}", alive_count);
-        std::println("Host inattivi: {}", results_.size() - alive_count);
-
-        if (alive_count > 0) {
-            std::println("\nHost attivi trovati:");
-            for (const auto& result : results_ | std::views::filter([](const auto& r) { return r.is_alive; })) {
-                std::println("  {} ({}ms)", result.ip, result.response_time.count());
+    void print_results() {
+        if (results_.empty()) {
+            std::println("\nNessun host attivo trovato");
+            if (!filter_.empty()) {
+                std::println("(con filtro hostname: *{}*)", filter_);
             }
+            return;
+        }
+
+        // Ordina risultati per IP
+        std::sort(results_.begin(), results_.end(),
+            [](const auto& a, const auto& b) {
+                struct in_addr addr_a, addr_b;
+#ifdef _WIN32
+                inet_pton(AF_INET, a.ip.c_str(), &addr_a);
+                inet_pton(AF_INET, b.ip.c_str(), &addr_b);
+#else
+                inet_aton(a.ip.c_str(), &addr_a);
+                inet_aton(b.ip.c_str(), &addr_b);
+#endif
+                return ntohl(addr_a.s_addr) < ntohl(addr_b.s_addr);
+            });
+
+        std::println("\n{}", std::string(80, '='));
+        std::println("HOST ATTIVI TROVATI");
+        std::println("{}", std::string(80, '='));
+
+        std::println("{:<20} {:<40}", "IP Address", "Hostname");
+        std::println("{}", std::string(80, '-'));
+
+        for (const auto& result : results_) {
+            std::println("{:<20} {:<40}",
+                result.ip,
+                result.hostname.empty() ? "N/A" : result.hostname);
+        }
+
+        std::println("\n{}", std::string(80, '='));
+        std::println("Totale host attivi: {}", results_.size());
+
+        if (!filter_.empty()) {
+            std::println("Filtro applicato: *{}*", filter_);
         }
     }
 };
@@ -234,8 +679,8 @@ struct IPRange {
 
     static std::expected<IPRange, std::string> parse(const std::vector<std::string>& args) {
         if (args.empty()) {
-            // Default: scansiona la subnet locale
-            return IPRange{ "192.168.1.0", 0, 254 };
+            // Default: auto-detect
+            return IPRange{ "", -1, -1 };
         }
 
         if (args.size() != 2) {
@@ -246,11 +691,22 @@ struct IPRange {
         range.base_ip = args[0];
 
         // Parse del range start:end
-        auto range_parts = args[1] | std::views::split(':')
-            | std::views::transform([](auto&& r) {
-            return std::string(r.begin(), r.end());
-                })
-            | std::ranges::to<std::vector>();
+        std::vector<std::string> range_parts;
+        std::string current;
+        for (char c : args[1]) {
+            if (c == ':') {
+                if (!current.empty()) {
+                    range_parts.push_back(current);
+                    current.clear();
+                }
+            }
+            else {
+                current += c;
+            }
+        }
+        if (!current.empty()) {
+            range_parts.push_back(current);
+        }
 
         if (range_parts.size() != 2) {
             return std::unexpected("Range deve essere nel formato start:end");
@@ -282,6 +738,8 @@ int main(int argc, char* argv[]) {
         desc.add_options()
             ("help,h", "Mostra questo messaggio di aiuto")
             ("output,o", po::value<std::string>(), "Salva i risultati su file")
+            ("filter,f", po::value<std::string>(), "Filtra per nome host (case insensitive)")
+            ("verbose,v", "Modalità verbose - mostra host trovati in tempo reale")
             ("ip-range", po::value<std::vector<std::string>>()->multitoken(),
                 "Range IP da scansionare (es: 192.168.1.0 0:254)");
 
@@ -299,9 +757,11 @@ int main(int argc, char* argv[]) {
             std::println("Network Scanner C++23 con Boost 1.88.0\n");
             std::println("Utilizzo: {} [opzioni] [ip_base start:end]", argv[0]);
             std::println("\nEsempi:");
-            std::println("  {} # Scansiona la subnet locale di default", argv[0]);
-            std::println("  {} 192.168.1.0 0:254", argv[0]);
-            std::println("  {} 10.0.0.0 1:100 -o risultati.txt", argv[0]);
+            std::println("  {} # Auto-rileva e scansiona la rete locale", argv[0]);
+            std::println("  {} -f router # Cerca dispositivi con 'router' nel nome", argv[0]);
+            std::println("  {} -v # Mostra host trovati in tempo reale", argv[0]);
+            std::println("  {} 192.168.1.0 0:254 -f PC", argv[0]);
+            std::println("  {} -o risultati.txt", argv[0]);
             std::cout << "\n" << desc << std::endl;
             return 0;
         }
@@ -320,32 +780,34 @@ int main(int argc, char* argv[]) {
 
         auto range = range_result.value();
 
-        // Esegui scansione
-        NetworkScanner scanner;
+        // Ottieni opzioni
+        std::string filter;
+        if (vm.count("filter"))
+            filter = vm["filter"].as<std::string>();
 
-        std::println("=== NETWORK SCANNER ===");
-        std::println("Sistema operativo: {}",
+        bool verbose = vm.count("verbose") > 0;
+
+        // Esegui scansione
+        NetworkScanner scanner(filter);
+
+        std::println("=== NETWORK SCANNER v2.0 ===\nSistema: {} | Thread: {}",
 #ifdef _WIN32
             "Windows"
 #else
             "Linux"
 #endif
-        );
+            , std::min(8, static_cast<int>(std::thread::hardware_concurrency())));
 
-        scanner.scan_range(range.base_ip, range.start, range.end);
-        scanner.print_summary();
+        scanner.scan_network(range.base_ip, range.start, range.end, verbose);
+        scanner.print_results();
 
         // Salva risultati se richiesto
-        if (vm.count("output")) {
+        if (vm.count("output"))
             scanner.save_results(vm["output"].as<std::string>());
-        }
-
     }
     catch (const std::exception& e) {
-        std::println(std::cerr, "Errore: {}", e.what());
-        std::println(std::cerr, "\nNota: Questo programma richiede privilegi di amministratore/root per l'uso di socket ICMP raw.");
+        std::println(std::cerr, "\nErrore: {}\nNota: Questo programma richiede privilegi di amministratore/root per l'uso di socket ICMP raw.", e.what());
         return 1;
     }
-
     return 0;
 }
