@@ -1,4 +1,4 @@
-# Network Scanner v2.0
+# Network Scanner v2.1
 
 Scanner di rete avanzato scritto in C++23 con Boost 1.88.0. Supporta rilevamento automatico della rete locale, risoluzione DNS, ricerca per hostname e scansione parallela multi-thread.
 
